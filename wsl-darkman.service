@@ -1,0 +1,13 @@
+[Unit]
+Description=Synchronize WSL appearance with Windows
+Documentation=man:systemd.service(5)
+
+[Service]
+Type=simple
+ExecStart=%h/.local/bin/wsl-darkman run
+Restart=on-failure
+RestartSec=5
+TimeoutStopSec=30
+
+[Install]
+WantedBy=default.target

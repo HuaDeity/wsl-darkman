@@ -1,0 +1,315 @@
+#!/usr/bin/env python3
+"""Follow Windows appearance from WSL. Python 3.9+, standard library only."""
+
+import argparse
+import base64
+import fcntl
+import logging
+import os
+from pathlib import Path
+import queue
+import shutil
+import signal
+import stat
+import subprocess
+import threading
+import time
+
+LOG = logging.getLogger("wsl-darkman")
+
+# Native registry notifications: one Windows process, no polling or WMI service.
+# Register before reading, and rearm before reading after each notification, so
+# a change during startup or processing cannot fall into an unobserved gap.
+WATCHER = r'''
+$ErrorActionPreference = 'Stop'
+$ProgressPreference = 'SilentlyContinue'
+try {
+Add-Type -TypeDefinition @'
+using System;
+using System.ComponentModel;
+using System.IO;
+using System.Runtime.InteropServices;
+using System.Threading;
+using Microsoft.Win32;
+using Microsoft.Win32.SafeHandles;
+
+public static class WslAppearance {
+    [DllImport("advapi32.dll", ExactSpelling = true)]
+    private static extern int RegNotifyChangeKeyValue(
+        SafeRegistryHandle key, bool subtree, uint filter,
+        SafeWaitHandle signal, bool asynchronous);
+
+    private static string ReadMode(RegistryKey key, string value) {
+        object raw = key.GetValue(value, 1);
+        if (!(raw is int) || ((int)raw != 0 && (int)raw != 1))
+            throw new InvalidDataException("Expected DWORD 0 or 1: " + value);
+        return (int)raw == 0 ? "dark" : "light";
+    }
+
+    public static void Run(string value, bool once) {
+        using (RegistryKey key = Registry.CurrentUser.OpenSubKey(
+            @"Software\Microsoft\Windows\CurrentVersion\Themes\Personalize")) {
+            if (key == null)
+                throw new IOException("Windows Personalize registry key is missing");
+            if (once) {
+                Console.WriteLine(ReadMode(key, value));
+                Console.Out.Flush();
+                return;
+            }
+            using (var changed = new AutoResetEvent(false))
+            using (var stopped = new ManualResetEvent(false)) {
+                // The Linux parent owns stdin. EOF also cleans up the Windows
+                // watcher if WSL terminates the parent without a graceful stop.
+                Thread parent = new Thread(delegate() {
+                    try {
+                        Stream input = Console.OpenStandardInput();
+                        while (input.ReadByte() != -1) { }
+                    } catch (IOException) { }
+                    try { stopped.Set(); } catch (ObjectDisposedException) { }
+                });
+                parent.IsBackground = true;
+                parent.Start();
+                string previous = null;
+                while (true) {
+                    int error = RegNotifyChangeKeyValue(
+                        key.Handle, false, 4, changed.SafeWaitHandle, true);
+                    if (error != 0) throw new Win32Exception(error);
+                    string mode = ReadMode(key, value);
+                    if (mode != previous) {
+                        Console.WriteLine(mode);
+                        Console.Out.Flush();
+                        previous = mode;
+                    }
+                    if (WaitHandle.WaitAny(new WaitHandle[] {stopped, changed}) == 0)
+                        return;
+                }
+            }
+        }
+    }
+}
+'@
+[WslAppearance]::Run('__VALUE__', __ONCE__)
+} catch {
+    [Console]::Error.WriteLine($_.Exception.ToString())
+    exit 1
+}
+'''
+
+
+def xdg(name, fallback):
+    return Path(os.environ.get(name) or Path.home() / fallback)
+
+
+def windows_environment():
+    env = os.environ.copy()
+    # User systemd services may not inherit the shell's interop socket. Prefer
+    # the inherited socket; otherwise use the most recent socket owned by us.
+    inherited = env.get("WSL_INTEROP")
+    if inherited and Path(inherited).exists():
+        return env
+    candidates = []
+    for path in Path("/run/WSL").glob("*_interop"):
+        try:
+            info = path.stat()
+            if stat.S_ISSOCK(info.st_mode) and info.st_uid == os.getuid():
+                candidates.append((info.st_mtime_ns, str(path)))
+        except OSError:
+            continue
+    if candidates:
+        env["WSL_INTEROP"] = max(candidates)[1]
+    return env
+
+
+def windows_command(args, once=False):
+    executable = args.powershell or shutil.which("powershell.exe")
+    if not executable:
+        fallback = Path("/mnt/c/Windows/System32/WindowsPowerShell/v1.0/powershell.exe")
+        if fallback.is_file():
+            executable = str(fallback)
+    if not executable:
+        raise RuntimeError("powershell.exe not found; enable WSL interop or use --powershell PATH")
+    value = "AppsUseLightTheme" if args.source == "apps" else "SystemUsesLightTheme"
+    script = WATCHER.replace("__VALUE__", value).replace("__ONCE__", "$true" if once else "$false")
+    encoded = base64.b64encode(script.encode("utf-16-le")).decode("ascii")
+    return [executable, "-NoLogo", "-NoProfile", "-NonInteractive", "-EncodedCommand", encoded]
+
+
+def parse_mode(raw):
+    mode = raw.decode("ascii").strip()
+    if mode not in ("dark", "light"):
+        raise ValueError("Unexpected Windows watcher output: " + repr(raw[:100]))
+    return mode
+
+
+def read_mode(args):
+    result = subprocess.run(windows_command(args, once=True), env=windows_environment(),
+                            stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                            stderr=subprocess.PIPE, timeout=30, check=True)
+    return parse_mode(result.stdout)
+
+
+def run_action(command, timeout, env=None):
+    # Hooks are independent: a broken hook must not block the others.
+    # Kill the process group on timeout so descendants cannot keep running.
+    try:
+        with subprocess.Popen(command, env=env, stdout=2, start_new_session=True) as child:
+            try:
+                result = child.wait(timeout=timeout)
+            except subprocess.TimeoutExpired:
+                os.killpg(child.pid, signal.SIGKILL)
+                child.wait()
+                LOG.warning("Timed out: %s", command[0])
+                return False
+        if result:
+            LOG.warning("Exit %s: %s", result, command[0])
+        return result == 0
+    except OSError as error:
+        LOG.warning("Cannot run %s: %s", command[0], error)
+        return False
+
+
+def hooks_for(mode):
+    roots = [Path(p) for p in (os.environ.get("XDG_DATA_DIRS") or
+                                "/usr/local/share:/usr/share").split(":") if p]
+    roots.append(xdg("XDG_DATA_HOME", ".local/share"))
+    # Match Darkman's two passes: legacy first, unified second. Each pass
+    # visits system directories in configured order and the user directory last.
+    # A nonexecutable entry masks a same-named executable from an earlier pass.
+    found = {}
+    for directory_name, arguments in ((mode + "-mode.d", []), ("darkman", [mode])):
+        for root in roots:
+            directory = root / directory_name
+            try:
+                entries = sorted(directory.iterdir())
+            except FileNotFoundError:
+                continue
+            except OSError as error:
+                LOG.warning("Cannot read hook directory %s: %s", directory, error)
+                continue
+            for hook in entries:
+                if hook.is_file() and os.access(hook, os.X_OK):
+                    found[hook.name] = [str(hook), *arguments]
+                else:
+                    found.pop(hook.name, None)
+    return [command for _, command in sorted(found.items())]
+
+
+def apply_mode(mode, args):
+    LOG.info("Applying %s mode", mode)
+    if args.backend == "darkman":
+        return run_action(["darkman", "set", mode], args.hook_timeout)
+    ok = True
+    if not args.no_gsettings and shutil.which("gsettings"):
+        preference = "prefer-dark" if mode == "dark" else "prefer-light"
+        ok = run_action(["gsettings", "set", "org.gnome.desktop.interface",
+                         "color-scheme", preference], args.hook_timeout)
+    env = os.environ.copy()
+    env["WSL_DARKMAN_MODE"] = mode
+    for command in hooks_for(mode):
+        ok = run_action(command, args.hook_timeout, env) and ok
+    return ok
+
+
+def forward_lines(stream, events):
+    try:
+        for line in iter(stream.readline, b""):
+            events.put(line)
+    finally:
+        events.put(None)
+
+
+def watch_session(args, stop):
+    events = queue.Queue()
+    # stderr is inherited so PowerShell diagnostics remain visible in journalctl.
+    with subprocess.Popen(windows_command(args), env=windows_environment(),
+                          stdin=subprocess.PIPE, stdout=subprocess.PIPE) as child:
+        reader = threading.Thread(target=forward_lines, args=(child.stdout, events), daemon=True)
+        reader.start()
+        previous = None
+        deadline = time.monotonic() + 30
+        try:
+            while not stop.is_set():
+                try:
+                    raw = events.get(timeout=0.5)
+                except queue.Empty:
+                    if previous is None and time.monotonic() >= deadline:
+                        raise RuntimeError("Windows watcher did not report its initial mode within 30 seconds")
+                    continue
+                if raw is None:
+                    raise RuntimeError("Windows watcher exited (status %s)" % child.poll())
+                mode = parse_mode(raw)
+                if mode != previous:
+                    applied = apply_mode(mode, args)
+                    if args.backend == "darkman" and not applied:
+                        raise RuntimeError("Could not send mode to Darkman; check that its service is running")
+                    previous = mode
+        finally:
+            child.stdin.close()
+            try:
+                child.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                child.kill()
+                child.wait()
+            reader.join(timeout=1)
+
+
+def run_daemon(args, stop):
+    runtime = os.environ.get("XDG_RUNTIME_DIR")
+    lock_dir = (Path(runtime) if runtime else xdg("XDG_CACHE_HOME", ".cache")) / "wsl-darkman"
+    lock_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
+    with (lock_dir / "daemon.lock").open("a") as lock:
+        try:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            raise RuntimeError("Another wsl-darkman daemon is already running") from None
+        delay = 1
+        while not stop.is_set():
+            try:
+                watch_session(args, stop)
+            except (OSError, RuntimeError, ValueError) as error:
+                LOG.warning("%s; reconnecting in %ss", error, delay)
+            if stop.wait(delay):
+                break
+            delay = min(delay * 2, 30)
+
+
+def positive_seconds(value):
+    import math
+    result = float(value)
+    if not math.isfinite(result) or result <= 0:
+        raise argparse.ArgumentTypeError("must be a finite positive number")
+    return result
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("command", nargs="?", choices=("run", "get", "once"), default="run",
+                        help="run: watch continuously (default); get: print host mode; once: synchronize now")
+    parser.add_argument("--source", choices=("apps", "system"), default="apps",
+                        help="Windows app appearance (default) or taskbar/system appearance")
+    parser.add_argument("--powershell", metavar="PATH", help="Windows powershell.exe path inside WSL")
+    parser.add_argument("--backend", choices=("standalone", "darkman"), default="standalone",
+                        help="apply preferences/hooks directly (default), or send mode to a running Darkman")
+    parser.add_argument("--no-gsettings", action="store_true", help="skip the standalone GNOME preference update; run hooks only")
+    parser.add_argument("--hook-timeout", type=positive_seconds, default=10,
+                        help="seconds allowed per action (default: 10)")
+    args = parser.parse_args()
+    logging.basicConfig(level=logging.INFO, format="%(name)s: %(levelname)s: %(message)s")
+    stop = threading.Event()
+    for signum in (signal.SIGINT, signal.SIGTERM):
+        signal.signal(signum, lambda *_: stop.set())
+    try:
+        if args.command == "get":
+            print(read_mode(args))
+        elif args.command == "once":
+            return 0 if apply_mode(read_mode(args), args) else 1
+        else:
+            run_daemon(args, stop)
+        return 0
+    except (OSError, RuntimeError, ValueError, subprocess.SubprocessError) as error:
+        LOG.error("%s", error)
+        return 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
