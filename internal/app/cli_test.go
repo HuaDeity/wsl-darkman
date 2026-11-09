@@ -1,6 +1,6 @@
 //go:build linux
 
-package main
+package app
 
 import (
 	"bytes"
@@ -157,8 +157,7 @@ func TestProcessHelper(t *testing.T) {
 		fmt.Fprintln(os.Stderr, "simulated Windows failure")
 		os.Exit(7)
 	case "cli":
-		os.Args = append([]string{"wsl-darkman"}, os.Args[separator+2:]...)
-		main()
+		os.Exit(Run(os.Args[separator+2:], os.Stdout, os.Stderr))
 	default:
 		os.Exit(9)
 	}

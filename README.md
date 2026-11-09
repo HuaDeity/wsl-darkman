@@ -45,8 +45,8 @@ If `go` is not on your path, use `make GO=/path/to/go install`.
 Cross-compilation for common WSL architectures also uses the Go toolchain:
 
 ```sh
-CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -trimpath -ldflags='-s -w' -o bin/wsl-darkman-linux-amd64 .
-CGO_ENABLED=0 GOOS=linux GOARCH=arm64 go build -trimpath -ldflags='-s -w' -o bin/wsl-darkman-linux-arm64 .
+CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -trimpath -ldflags='-s -w' -o bin/wsl-darkman-linux-amd64 ./cmd/wsl-darkman
+CGO_ENABLED=0 GOOS=linux GOARCH=arm64 go build -trimpath -ldflags='-s -w' -o bin/wsl-darkman-linux-arm64 ./cmd/wsl-darkman
 ```
 
 To upgrade from the earlier Python prototype, run `make install` from this
@@ -225,4 +225,23 @@ a simulated host process. The native Windows registry path needs a WSL smoke tes
 4. Stop with Ctrl-C or systemd; verify its Windows PowerShell watcher exits.
 5. Restart WSL and confirm the user service reconnects and reapplies the host mode.
 
-See `DARKMAN-STUDY.md` for the upstream source review and design decisions.
+## Repository layout
+
+```text
+cmd/wsl-darkman/              Executable entry point
+internal/app/                 CLI, daemon, hooks, Windows interop, and tests
+  windows-watcher.ps1         Embedded Windows registry watcher
+contrib/systemd/              User service unit
+docs/                         Design notes and upstream research
+bin/                          Generated binaries (ignored by Git)
+go.mod                        Go module and minimum toolchain version
+Makefile                      Build, test, and installation commands
+```
+
+Tests live beside the code they exercise. The PowerShell watcher lives with its
+Go embed declaration so builds include it without a separate installation step.
+Implementation stays in one internal package while the executable entry point
+contains no application logic.
+
+See the [Darkman study](docs/darkman-study.md) for the upstream source review and
+design decisions.

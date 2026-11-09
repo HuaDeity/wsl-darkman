@@ -1,6 +1,7 @@
 //go:build linux
 
-package main
+// Package app implements the wsl-darkman CLI and appearance synchronization.
+package app
 
 import (
 	"context"
@@ -10,7 +11,6 @@ import (
 	"io"
 	"log"
 	"math"
-	"os"
 	"os/signal"
 	"strings"
 	"syscall"
@@ -128,21 +128,24 @@ func execute(ctx context.Context, o options, output io.Writer) error {
 	return nil
 }
 
-func main() {
+// Run executes the CLI and returns its process exit status. It owns signal
+// handling so the command entry point only needs to pass arguments and streams.
+func Run(args []string, stdout, stderr io.Writer) int {
 	log.SetPrefix("wsl-darkman: ")
 	log.SetFlags(0)
-	o, err := parseOptions(os.Args[1:], os.Stderr)
+	o, err := parseOptions(args, stderr)
 	if errors.Is(err, flag.ErrHelp) {
-		return
+		return 0
 	}
 	if err != nil {
-		log.Print(err)
-		os.Exit(2)
+		fmt.Fprintf(stderr, "wsl-darkman: %v\n", err)
+		return 2
 	}
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
-	if err := execute(ctx, o, os.Stdout); err != nil && ctx.Err() == nil {
-		log.Print(err)
-		os.Exit(1)
+	if err := execute(ctx, o, stdout); err != nil && ctx.Err() == nil {
+		fmt.Fprintf(stderr, "wsl-darkman: %v\n", err)
+		return 1
 	}
+	return 0
 }
