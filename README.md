@@ -4,10 +4,16 @@ Development status: automated tests pass with a simulated Windows host. Native
 Windows registry notifications and real WSL/desktop portal integration still
 need smoke testing on a Windows machine.
 
-A small, event-driven WSL appearance synchronizer. It follows Windows instead
-of sunrise/sunset and uses only Python's standard library on Linux. One persistent
+A small, event-driven WSL appearance synchronizer written in Go. It follows
+Windows instead of sunrise/sunset and uses only Go's standard library. One persistent
 Windows PowerShell process waits on native `RegNotifyChangeKeyValue` notifications;
 there is no periodic registry polling or recurring PowerShell startup.
+
+Go fits this tool's process supervision, pipe handling, cancellation, and daemon
+lifecycle. The build produces one static Linux executable with no Python or Go
+runtime to install. It also matches Darkman's language and supports easy Linux
+amd64/arm64 builds. The embedded Windows PowerShell watcher is included in the
+binary; it does not need to be installed as a separate script.
 
 The standalone backend applies preferences and hooks directly. The optional
 `--backend darkman` backend supplies Windows mode changes to an installed Darkman,
@@ -15,7 +21,8 @@ which provides its existing hooks, IPC, and desktop portal integration.
 
 ## Requirements
 
-- WSL with Windows executable interop enabled and Python 3.9 or newer.
+- WSL with Windows executable interop enabled.
+- Go 1.22 or newer to build from source. No Go installation is needed to run the binary.
 - Windows 10/11 and built-in Windows PowerShell 5.1 with `Add-Type` permitted.
 - Optional: `gsettings` and a working user D-Bus session for GNOME/GTK preferences.
 - Optional: user systemd for background startup. Foreground operation works without it.
@@ -30,6 +37,21 @@ make install
 ~/.local/bin/wsl-darkman once     # synchronize now
 ~/.local/bin/wsl-darkman run      # keep following changes; Ctrl-C stops
 ```
+
+To build without installing, run `make build` and use `bin/wsl-darkman`.
+The build disables cgo, so the Linux executable does not depend on libc.
+If `go` is not on your path, use `make GO=/path/to/go install`.
+
+Cross-compilation for common WSL architectures also uses the Go toolchain:
+
+```sh
+CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -trimpath -ldflags='-s -w' -o bin/wsl-darkman-linux-amd64 .
+CGO_ENABLED=0 GOOS=linux GOARCH=arm64 go build -trimpath -ldflags='-s -w' -o bin/wsl-darkman-linux-arm64 .
+```
+
+To upgrade from the earlier Python prototype, run `make install` from this
+version and restart `wsl-darkman.service`. It replaces the executable at the same
+path. Existing hook directories and service options continue to work.
 
 For automatic startup with user systemd:
 
@@ -183,7 +205,13 @@ systemctl --user disable --now wsl-darkman.service
 
 ```sh
 make test
+make vet
+go test -race ./...
 ```
+
+The race detector is a development check that requires a C compiler; the normal
+build and test suite have no cgo dependency. Tests use Go subprocess helpers and
+shell hook fixtures. The interop-discovery test creates local Unix sockets.
 
 Tests exercise mode parsing, real legacy and unified hook execution, masking and
 precedence, hook failure/timeout isolation, backend delegation/failure handling,

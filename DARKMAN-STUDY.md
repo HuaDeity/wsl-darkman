@@ -89,11 +89,14 @@ Sources: [configuration.go](https://gitlab.com/WhyNotHugo/darkman/-/blob/main/co
 
 Also reviewed upstream's installation rules, GTK and Neovim example hooks, and
 [ISC licence](https://gitlab.com/WhyNotHugo/darkman/-/blob/main/LICENCE).
-No upstream Go code was copied into this Python implementation.
+No upstream Go code was copied into this implementation. The original Python
+prototype has since been replaced with a Go implementation using only the
+standard library. The Windows notification script is embedded into the binary.
 
 ## Verification
 
-The local suite now has 19 passing tests, including real unified/legacy hook
-execution, cross-root overrides, masks, backend delegation, failed-backend
-recovery, a simulated Darkman executable, watcher reconnects, and process shutdown. Windows registry events and
-the real Darkman/portal integration were not executed in this Linux environment.
+The Go suite covers real unified/legacy hook execution, cross-root overrides,
+masks, backend delegation, failed-backend recovery, a simulated Darkman executable,
+watcher reconnects, Unix interop socket discovery, timeouts, and process shutdown.
+Windows registry events and the real Darkman/portal integration were not executed
+in this Linux environment.
