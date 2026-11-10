@@ -1,207 +1,189 @@
 # wsl-darkman
 
-Development status: automated tests pass with a simulated Windows host. Native
-Windows registry notifications and real WSL/desktop portal integration still
-need smoke testing on a Windows machine.
+A standalone Go user service that synchronizes Linux application appearance with
+Windows. It follows native Windows registry notifications rather than sunrise and
+sunset. Darkman is a design reference, not a runtime dependency.
 
-A small, event-driven WSL appearance synchronizer written in Go. It follows
-Windows instead of sunrise/sunset and uses only Go's standard library. One persistent
-Windows PowerShell process waits on native `RegNotifyChangeKeyValue` notifications;
-there is no periodic registry polling or recurring PowerShell startup.
+Windows appearance is published through our own XDG settings portal, applied to
+GNOME preferences where available, and passed to application hooks. The Windows
+watcher is embedded in the Linux binary and uses built-in Windows PowerShell.
+There is no periodic registry polling or recurring PowerShell startup.
 
-Go fits this tool's process supervision, pipe handling, cancellation, and daemon
-lifecycle. The build produces one static Linux executable with no Python or Go
-runtime to install. It also matches Darkman's language and supports easy Linux
-amd64/arm64 builds. The embedded Windows PowerShell watcher is included in the
-binary; it does not need to be installed as a separate script.
-
-The standalone backend applies preferences and hooks directly. The optional
-`--backend darkman` backend supplies Windows mode changes to an installed Darkman,
-which provides its existing hooks, IPC, and desktop portal integration.
+Development status: tests cover a simulated Windows host, a real private D-Bus
+session, and real GSettings/dconf with a reduced schema fixture. Native Windows
+notifications and end-to-end WSL application appearance still need smoke testing.
 
 ## Requirements
 
 - WSL with Windows executable interop enabled.
-- Go 1.22 or newer to build from source. No Go installation is needed to run the binary.
-- Windows 10/11 and built-in Windows PowerShell 5.1 with `Add-Type` permitted.
-- Optional: `gsettings` and a working user D-Bus session for GNOME/GTK preferences.
-- Optional: user systemd for background startup. Foreground operation works without it.
+- Windows 10/11 with Windows PowerShell 5.1 and `Add-Type` permitted.
+- Go 1.22+ to build. The executable needs no Python or separately installed Go runtime.
+- A user session D-Bus for the default portal mode. Use `--no-portal` otherwise.
+- `xdg-desktop-portal` for applications to consume the portal preference.
+- Optional: `gsettings`, GNOME interface schemas, and dconf for direct GNOME/GTK settings.
 
-## Install and run
+The Go dependencies are `godbus/dbus` and its `x/sys` dependency, pinned in
+`go.mod`/`go.sum` and linked into the binary. Darkman is never invoked.
 
-From this directory, inside WSL:
+## Build and install
+
+Inside WSL, from this directory:
 
 ```sh
 make install
-~/.local/bin/wsl-darkman get      # print Windows mode: light or dark
-~/.local/bin/wsl-darkman once     # synchronize now
-~/.local/bin/wsl-darkman run      # keep following changes; Ctrl-C stops
+systemctl --user daemon-reload
+systemctl --user enable --now wsl-darkman.service
+journalctl --user -u wsl-darkman.service -f
 ```
 
-To build without installing, run `make build` and use `bin/wsl-darkman`.
-The build disables cgo, so the Linux executable does not depend on libc.
-If `go` is not on your path, use `make GO=/path/to/go install`.
+The default prefix is `~/.local`. Installation includes the executable, user
+systemd unit, portal descriptor, and D-Bus activation file. It does not rewrite
+application configurations or your portal selection. Follow the portal setup
+below to make applications use this service's preference.
 
-Cross-compilation for common WSL architectures also uses the Go toolchain:
+`make build` writes `bin/wsl-darkman`. Builds disable cgo and produce a static
+Linux executable. Use `make GO=/path/to/go install` for a compiler outside `PATH`.
+The supplied unit expects `~/.local/bin`; adjust its `ExecStart` if using a custom
+prefix. `DESTDIR` is supported for packaging.
 
 ```sh
 CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -trimpath -ldflags='-s -w' -o bin/wsl-darkman-linux-amd64 ./cmd/wsl-darkman
 CGO_ENABLED=0 GOOS=linux GOARCH=arm64 go build -trimpath -ldflags='-s -w' -o bin/wsl-darkman-linux-arm64 ./cmd/wsl-darkman
 ```
 
-To upgrade from the earlier Python prototype, run `make install` from this
-version and restart `wsl-darkman.service`. It replaces the executable at the same
-path. Existing hook directories and service options continue to work.
+## Linux application settings
 
-For automatic startup with user systemd:
+There is no single setting that controls every Linux application. The detailed
+[Linux appearance guide](docs/linux-appearance.md) explains the settings and
+application-specific hooks learned from Darkman and upstream toolkit documentation.
 
-```sh
-systemctl --user daemon-reload
-systemctl --user enable --now wsl-darkman.service
-journalctl --user -u wsl-darkman.service -f
-```
+| Integration | What this service does |
+| --- | --- |
+| XDG settings portal | Publishes `org.freedesktop.appearance/color-scheme`: `1` dark, `2` light, `0` before Windows mode is known; emits change signals. |
+| GNOME color preference | Sets `org.gnome.desktop.interface color-scheme` to `prefer-dark` or `prefer-light` when the installed schema provides it. |
+| Named GTK themes | Optionally sets `org.gnome.desktop.interface gtk-theme` using the pair of theme names you supply. |
+| Other applications | Runs executable hooks with the new mode; examples cover Xfce and Neovim. |
 
-Run these as your regular WSL user. The supplied unit expects the default
-`~/.local/bin` installation; change `ExecStart` if you install elsewhere.
-The service runs while the WSL user session is active. It does not start the
-distribution from Windows or keep WSL running after shutdown. Do not run another
-theme controller against the same settings in standalone mode. When using the
-Darkman backend, disable Darkman's solar scheduler as described below.
-
-## Behavior
-
-The default source is the Windows **app** setting,
-`HKCU\Software\Microsoft\Windows\CurrentVersion\Themes\Personalize\AppsUseLightTheme`.
-`0` means dark, `1` means light; an absent value follows Windows' light default.
-Use `--source system` to follow `SystemUsesLightTheme`, which controls the shell
-and taskbar. Windows' Custom mode can set these independently.
-
-The daemon applies the current mode immediately on startup and on reconnect,
-then only applies changed modes. Unrelated Personalize value changes and duplicate
-notifications do not rerun hooks. Rapid changes may coalesce into the latest mode.
-The watcher arms the notification before reading, including after each event.
-Failures reconnect with a 1–30 second backoff. A singleton lock prevents duplicate
-daemons within the same user runtime/cache directory.
-
-On each mode change:
-
-1. If available, `gsettings` sets `org.gnome.desktop.interface color-scheme`
-   to `prefer-dark` or `prefer-light`.
-2. Executable hooks in `darkman/` receive `light` or `dark` as their first argument.
-   Legacy `light-mode.d` or `dark-mode.d` hooks also work, without arguments.
-
-Hook lookup follows the current Darkman implementation: scan legacy directories
-first, then unified `darkman/` directories. Each pass visits `$XDG_DATA_DIRS`
-(default `/usr/local/share:/usr/share`) in its configured order, followed by
-`$XDG_DATA_HOME` (default `~/.local/share`). Later entries replace earlier entries
-with the same filename; a nonexecutable entry removes the earlier hook. Unified
-entries override same-named legacy entries even across different data roots.
-Each hook needs a shebang and executable permission. Unlike current Darkman,
-standalone execution is sequential in filename order, with a timeout per hook.
-`WSL_DARKMAN_MODE` is set to `light` or `dark`. Hook output goes to stderr/the journal.
-Each action has a 10 second timeout; failures are logged and remaining hooks run.
-Failed actions are retried at the next mode change/reconnect or with `once`.
-`once` returns nonzero if an action fails.
-
-Example for older GTK applications using named themes:
+Theme selection is opt-in so the service does not guess your preferred or
+installed themes:
 
 ```sh
-mkdir -p ~/.local/share/darkman
-cat > ~/.local/share/darkman/gtk-theme <<'EOF'
-#!/bin/sh
-case "$1" in
-    dark) theme=Adwaita-dark ;;
-    light) theme=Adwaita ;;
-    *) exit 1 ;;
-esac
-exec gsettings set org.gnome.desktop.interface gtk-theme "$theme"
-EOF
-chmod +x ~/.local/share/darkman/gtk-theme
+wsl-darkman run --gtk-light-theme Adwaita --gtk-dark-theme Adwaita-dark
 ```
 
-The named themes must be installed. WSLg applications vary in how they consume
-appearance: some require application-specific hooks or a restart. Qt apps and
-terminals are not automatically configured by the GTK preference. This utility
-does not implement Darkman's socket/D-Bus APIs or a desktop portal itself.
+Both names must be supplied and installed. Missing optional GNOME schemas are
+logged and skipped; failure to apply an explicitly requested theme is reported.
+An application configured to force its own appearance may ignore system changes.
 
-## Using Darkman for application integrations
+## Select our settings portal
 
-This mode lets Darkman handle its own hooks and portal while wsl-darkman supplies
-the Windows appearance. First install Darkman separately. In the existing
-`~/.config/darkman/config.yaml`, set `usegeoclue: false`, remove `lat` and `lng`,
-and keep `portal: true` if using its portal. Remove `DARKMAN_LAT`, `DARKMAN_LNG`,
-and conflicting `DARKMAN_USEGEOCLUE` environment overrides from Darkman's service
-environment. Both configured coordinates and geoclue must be disabled to prevent
-solar transitions. Restart Darkman after changing its configuration.
-
-```sh
-systemctl --user enable --now darkman.service
-wsl-darkman run --backend darkman
-```
-
-In this mode each host transition sends `darkman set light` or `darkman set dark`.
-wsl-darkman does not also run local hooks or gsettings. Darkman owns their
-execution, timing, duplicate suppression, and error reporting; a successful
-`darkman set` only confirms that its CLI accepted/sent the request, not that all
-application changes finished. A failed CLI call triggers reconnect/backoff and
-resends the current host mode, even without another Windows transition.
-`wsl-darkman get` still queries Windows; use `darkman get` to query Darkman.
-
-For background startup, use `systemctl --user edit wsl-darkman.service`:
+Install your distribution's `xdg-desktop-portal`, then merge this entry into the
+`[preferred]` section of your existing
+`~/.config/xdg-desktop-portal/portals.conf`:
 
 ```ini
-[Unit]
-Requires=darkman.service
-After=darkman.service
-
-[Service]
-ExecStart=
-ExecStart=%h/.local/bin/wsl-darkman run --backend darkman
+[preferred]
+org.freedesktop.impl.portal.Settings=wsl-darkman
 ```
 
-Then reload and restart wsl-darkman. Follow
-[Darkman's portal instructions](https://darkman.whynothugo.nl/darkman.1/#XDG_Settings_portal)
-to select its settings backend in the desktop portal configuration. Running
-Darkman alone does not configure the portal frontend to use it. This integration
-has been checked with a simulated CLI; installed-Darkman/portal behavior still
-needs validation on the target WSL session.
-
-## Options and troubleshooting
+Preserve existing defaults and other interface selections. If you already use a
+Settings provider such as `gtk`, keep it after ours, for example
+`org.freedesktop.impl.portal.Settings=wsl-darkman;gtk`. Our implementation exposes
+only `color-scheme`; retained providers can supply other keys. Desktop-specific
+configuration files can take precedence; see the [portal configuration manual](https://flatpak.github.io/xdg-desktop-portal/docs/portals.conf.html).
 
 ```sh
-wsl-darkman run --source system
-wsl-darkman run --no-gsettings
+systemctl --user restart wsl-darkman.service
+systemctl --user restart xdg-desktop-portal.service
+gdbus call --session --dest org.freedesktop.portal.Desktop \
+  --object-path /org/freedesktop/portal/desktop \
+  --method org.freedesktop.portal.Settings.ReadOne \
+  org.freedesktop.appearance color-scheme
+```
+
+The result should contain `uint32 1` or `uint32 2`, matching Windows. The backend
+owns `org.freedesktop.impl.portal.desktop.wsl_darkman`. Applications read the
+public portal frontend, not that implementation name directly.
+
+Current portal releases discover per-user descriptors under
+`~/.local/share/xdg-desktop-portal/portals`. If your distribution's older frontend
+only scans its system portal directory, install just the descriptor there:
+
+```sh
+sudo install -Dm644 contrib/portal/wsl-darkman.portal /usr/share/xdg-desktop-portal/portals/wsl-darkman.portal
+```
+
+The user unit uses D-Bus readiness, so it becomes active when the portal name is
+owned. A session bus disconnection stops the watcher and exits with an error;
+systemd restarts the service and reconnects it.
+
+## Commands and service options
+
+```sh
+wsl-darkman get                  # print current Windows mode
+wsl-darkman once                 # apply GNOME preferences and hooks once
+wsl-darkman run                  # publish the portal and synchronize continuously
+wsl-darkman run --source system  # follow Windows shell/taskbar instead of app mode
+wsl-darkman run --no-gsettings   # portal and hooks only
+wsl-darkman run --no-portal      # GNOME preferences and hooks only
 wsl-darkman run --hook-timeout 20
-wsl-darkman get --powershell /mnt/c/Windows/System32/WindowsPowerShell/v1.0/powershell.exe
 ```
 
-`--no-gsettings` uses hooks only, useful when no GNOME schema/session is present.
-For service options, run `systemctl --user edit wsl-darkman.service` and use:
+`once` does not provide a persistent portal. The default Windows source is
+`AppsUseLightTheme`; `--source system` selects `SystemUsesLightTheme` under
+`HKCU\Software\Microsoft\Windows\CurrentVersion\Themes\Personalize`.
+`0` is dark and `1` is light; an absent value uses light.
+
+For persistent options, use `systemctl --user edit wsl-darkman.service`:
 
 ```ini
 [Service]
 ExecStart=
-ExecStart=%h/.local/bin/wsl-darkman run --source system --no-gsettings
+ExecStart=%h/.local/bin/wsl-darkman run --gtk-light-theme Adwaita --gtk-dark-theme Adwaita-dark
 ```
 
-Then `systemctl --user daemon-reload` and `systemctl --user restart wsl-darkman`.
+Then reload and restart the unit. Without a user session bus, use this override
+instead, and do not select our portal in `portals.conf`:
+
+```ini
+[Service]
+Type=simple
+BusName=
+ExecStart=
+ExecStart=%h/.local/bin/wsl-darkman run --no-portal
+```
+
+To upgrade, run `make install`, reload systemd, and restart the unit. Remove any
+old `--backend` options or Darkman service dependencies from local overrides;
+the Darkman backend has been removed. Stop another appearance controller if it
+writes the same Linux preferences.
+
+## Hooks and recovery
+
+Hooks use Darkman's executable convention without requiring Darkman: unified
+`darkman/` directories receive `light` or `dark` as `$1`; legacy `light-mode.d`
+and `dark-mode.d` hooks receive no arguments. `WSL_DARKMAN_MODE` is also set.
+Search and masking rules are documented in the [appearance guide](docs/linux-appearance.md).
+
+The host mode is applied at startup and reconnect. Duplicate events are ignored;
+rapid host changes may coalesce to the latest mode. Failed host connections retry
+with a 1–30 second backoff. Each hook has a 10 second timeout; failures are logged
+and remaining hooks run. Failed appearance actions retry at the next mode change,
+reconnect, or `once`. `once` returns nonzero for action failures.
 
 If interop fails, first check that `powershell.exe -NoProfile -Command '$PSVersionTable.PSVersion'`
-works from a WSL shell. The daemon uses the inherited `WSL_INTEROP`, or discovers
-the newest accessible interop socket owned by your user in `/run/WSL`. It also
-checks the standard `/mnt/c` PowerShell path when systemd lacks Windows entries
-in `PATH`. Custom Windows mount locations require `--powershell`.
-If notifications stop because the key is deleted or the watcher exits, it is
-restarted and the current mode is reapplied. Closing the parent's stdin signals
-the Windows watcher to exit, including after unexpected Linux parent termination.
+works inside WSL. The service uses an inherited valid `WSL_INTEROP` socket or finds
+the newest one owned by your user under `/run/WSL`. It checks the standard `/mnt/c`
+PowerShell path when Windows entries are absent from `PATH`. A custom mount
+location needs `--powershell /path/to/powershell.exe`.
 
-To stop automatic synchronization:
+To disable automatic synchronization:
 
 ```sh
 systemctl --user disable --now wsl-darkman.service
 ```
 
-## Validation
+## Validation and layout
 
 ```sh
 make test
@@ -209,39 +191,24 @@ make vet
 go test -race ./...
 ```
 
-The race detector is a development check that requires a C compiler; the normal
-build and test suite have no cgo dependency. Tests use Go subprocess helpers and
-shell hook fixtures. The interop-discovery test creates local Unix sockets.
-
-Tests exercise mode parsing, real legacy and unified hook execution, masking and
-precedence, hook failure/timeout isolation, backend delegation/failure handling,
-event deduplication, watcher recovery, and graceful shutdown using
-a simulated host process. The native Windows registry path needs a WSL smoke test:
-
-1. Start `wsl-darkman run` in WSL and confirm the initial mode is applied.
-2. In Windows Settings → Personalization → Colors, change the app mode both ways.
-3. Confirm each actual transition produces one application log entry and runs the
-   corresponding hooks. In Custom mode, check `--source apps` versus `system`.
-4. Stop with Ctrl-C or systemd; verify its Windows PowerShell watcher exits.
-5. Restart WSL and confirm the user service reconnects and reapplies the host mode.
-
-## Repository layout
+Integration tests need `dbus-daemon`; the real settings test also needs
+`gsettings`, `glib-compile-schemas`, and `dconf-service`. They use private bus
+sessions and temporary settings databases. These integration checks are skipped
+when their required development tools are absent. The race detector needs a C
+compiler; production builds do not.
 
 ```text
-cmd/wsl-darkman/              Executable entry point
-internal/app/                 CLI, daemon, hooks, Windows interop, and tests
-  windows-watcher.ps1         Embedded Windows registry watcher
-contrib/systemd/              User service unit
-docs/                         Design notes and upstream research
-bin/                          Generated binaries (ignored by Git)
-go.mod                        Go module and minimum toolchain version
-Makefile                      Build, test, and installation commands
+cmd/wsl-darkman/     Executable entry point
+internal/app/        CLI, synchronization, Linux settings, portal, and tests
+contrib/systemd/     User service unit
+contrib/dbus/        D-Bus activation template
+contrib/portal/      XDG portal descriptor
+examples/hooks/      Optional application integrations
+docs/                Design notes and application settings reference
+bin/                 Generated binaries (ignored by Git)
 ```
 
-Tests live beside the code they exercise. The PowerShell watcher lives with its
-Go embed declaration so builds include it without a separate installation step.
-Implementation stays in one internal package while the executable entry point
-contains no application logic.
-
-See the [Darkman study](docs/darkman-study.md) for the upstream source review and
-design decisions.
+For the remaining WSL smoke test, start the service, change Windows app mode both
+ways, check the public portal result and application appearance, and verify that
+service stop/restart and WSL suspend/resume clean up and reconnect the Windows
+watcher. See the [Darkman study](docs/darkman-study.md) for the upstream findings.

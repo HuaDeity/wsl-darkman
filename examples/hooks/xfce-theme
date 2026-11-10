@@ -1,0 +1,8 @@
+#!/bin/sh
+# Optional Xfce integration. Choose names available in your theme installation.
+case "$1" in
+    dark) theme=Adwaita-dark ;;
+    light) theme=Adwaita ;;
+    *) exit 2 ;;
+esac
+exec xfconf-query -c xsettings -p /Net/ThemeName -s "$theme"

@@ -1,0 +1,12 @@
+#!/bin/sh
+# Requires neovim-remote and Neovim instances listening for remote commands.
+case "$1" in
+    dark|light) ;;
+    *) exit 2 ;;
+esac
+mode=$1
+servers=$(nvr --serverlist) || exit
+printf '%s\n' "$servers" | while IFS= read -r server; do
+    [ -n "$server" ] || continue
+    nvr --servername "$server" -cc "set background=$mode" || exit
+done

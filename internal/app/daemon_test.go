@@ -95,26 +95,28 @@ func TestWatcherForcedShutdown(t *testing.T) {
 	}
 }
 
-func TestFailedBackendReconnectsAndResynchronizes(t *testing.T) {
+func TestWatcherReconnectsAndResynchronizes(t *testing.T) {
 	o := testOptions()
-	o.backend = "darkman"
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	var attempts int
 	var seen []mode
 	reconnect(ctx, o, func(ctx context.Context) error {
 		attempts++
-		return followWatcher(ctx, helperCommand(t, "stream"), o, func(_ context.Context, m mode) bool {
+		action := "stream"
+		if attempts == 1 {
+			action = "eof"
+		}
+		return followWatcher(ctx, helperCommand(t, action), o, func(_ context.Context, m mode) bool {
 			seen = append(seen, m)
-			if attempts == 1 {
-				return false
+			if attempts == 2 {
+				cancel()
 			}
-			cancel()
 			return true
 		})
 	})
 	if attempts != 2 || !reflect.DeepEqual(seen, []mode{dark, dark}) {
-		t.Fatalf("did not resend host mode after backend failure: attempts=%d modes=%v", attempts, seen)
+		t.Fatalf("did not reapply host mode after reconnection: attempts=%d modes=%v", attempts, seen)
 	}
 }
 
@@ -156,7 +158,7 @@ func TestCLISIGTERMStopsDaemonAndHost(t *testing.T) {
 	t.Setenv("HELPER_EXIT", exited)
 	host := fakeHost(t, root, "stream")
 	executable(t, filepath.Join(root, "user/dark-mode.d/ready"), `touch "$READY"`)
-	cmd := helperCommand(t, "cli", "run", "--powershell", host, "--no-gsettings")
+	cmd := helperCommand(t, "cli", "run", "--powershell", host, "--no-gsettings", "--no-portal")
 	var diagnostics bytes.Buffer
 	cmd.Stderr = &diagnostics
 	if err := cmd.Start(); err != nil {

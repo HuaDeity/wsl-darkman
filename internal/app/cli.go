@@ -25,16 +25,17 @@ const (
 )
 
 type options struct {
-	command, source, powershell, backend string
-	noGSettings                          bool
-	hookTimeout                          time.Duration
-	startupTimeout, shutdownTimeout      time.Duration
-	retryMin, retryMax                   time.Duration
+	command, source, powershell     string
+	gtkLightTheme, gtkDarkTheme     string
+	noGSettings, noPortal           bool
+	hookTimeout                     time.Duration
+	startupTimeout, shutdownTimeout time.Duration
+	retryMin, retryMax              time.Duration
 }
 
 func defaultOptions() options {
 	return options{
-		command: "run", source: "apps", backend: "standalone",
+		command: "run", source: "apps",
 		hookTimeout: 10 * time.Second, startupTimeout: 30 * time.Second,
 		shutdownTimeout: 5 * time.Second, retryMin: time.Second, retryMax: 30 * time.Second,
 	}
@@ -46,8 +47,10 @@ func parseOptions(args []string, output io.Writer) (options, error) {
 	f.SetOutput(output)
 	f.StringVar(&o.source, "source", o.source, "Windows appearance: apps or system")
 	f.StringVar(&o.powershell, "powershell", "", "Windows powershell.exe path inside WSL")
-	f.StringVar(&o.backend, "backend", o.backend, "Output backend: standalone or darkman")
 	f.BoolVar(&o.noGSettings, "no-gsettings", false, "Skip the standalone GNOME preference update")
+	f.BoolVar(&o.noPortal, "no-portal", false, "Disable the XDG appearance settings portal")
+	f.StringVar(&o.gtkLightTheme, "gtk-light-theme", "", "Installed GTK theme for light mode (requires --gtk-dark-theme)")
+	f.StringVar(&o.gtkDarkTheme, "gtk-dark-theme", "", "Installed GTK theme for dark mode (requires --gtk-light-theme)")
 	seconds := f.Float64("hook-timeout", 10, "Seconds allowed per action")
 	f.Usage = func() {
 		fmt.Fprintln(output, "Usage: wsl-darkman [run|get|once] [options]")
@@ -87,8 +90,11 @@ func parseOptions(args []string, output io.Writer) (options, error) {
 	if o.source != "apps" && o.source != "system" {
 		return o, fmt.Errorf("source must be apps or system")
 	}
-	if o.backend != "standalone" && o.backend != "darkman" {
-		return o, fmt.Errorf("backend must be standalone or darkman")
+	if (o.gtkLightTheme == "") != (o.gtkDarkTheme == "") {
+		return o, fmt.Errorf("gtk-light-theme and gtk-dark-theme must be supplied together")
+	}
+	if o.noGSettings && o.gtkLightTheme != "" {
+		return o, fmt.Errorf("GTK theme options cannot be combined with no-gsettings")
 	}
 	if math.IsNaN(*seconds) || math.IsInf(*seconds, 0) || *seconds <= 0 ||
 		*seconds >= float64(math.MaxInt64)/float64(time.Second) {

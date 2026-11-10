@@ -73,34 +73,42 @@ func TestHookFailureAndTimeoutContinue(t *testing.T) {
 	}
 }
 
-func TestBackendDelegation(t *testing.T) {
+func TestGSettingsAndThemeIntegration(t *testing.T) {
 	root := testEnvironment(t)
 	t.Setenv("CALLS", filepath.Join(root, "calls"))
 	t.Setenv("PATH", filepath.Join(root, "bin")+":"+os.Getenv("PATH"))
-	executable(t, filepath.Join(root, "bin/gsettings"), `printf '%s\n' "$*" >> "$CALLS"`)
-	darkman := executable(t, filepath.Join(root, "bin/darkman"), `printf '%s\n' "$*" >> "$CALLS"`)
+	executable(t, filepath.Join(root, "bin/gsettings"), `
+if [ "$1" = list-keys ]; then
+    printf 'color-scheme\ngtk-theme\n'
+else
+    printf '%s\n' "$*" >> "$CALLS"
+fi`)
 	executable(t, filepath.Join(root, "user/darkman/theme"), `echo hook >> "$CALLS"`)
 	o := testOptions()
 	o.noGSettings = false
+	o.gtkLightTheme, o.gtkDarkTheme = "Adwaita", "Adwaita-dark"
 	if !applyMode(context.Background(), dark, o) || !applyMode(context.Background(), light, o) {
 		t.Fatal("gsettings integration failed")
 	}
-	if got := fileContents(t, os.Getenv("CALLS")); got != "set org.gnome.desktop.interface color-scheme prefer-dark\nhook\nset org.gnome.desktop.interface color-scheme prefer-light\nhook\n" {
+	if got := fileContents(t, os.Getenv("CALLS")); got != "set org.gnome.desktop.interface color-scheme prefer-dark\nset org.gnome.desktop.interface gtk-theme \"Adwaita-dark\"\nhook\nset org.gnome.desktop.interface color-scheme prefer-light\nset org.gnome.desktop.interface gtk-theme \"Adwaita\"\nhook\n" {
 		t.Fatalf("gsettings calls: %q", got)
 	}
-	if err := os.Remove(os.Getenv("CALLS")); err != nil {
-		t.Fatal(err)
-	}
-	o.backend = "darkman"
-	if !applyMode(context.Background(), light, o) {
-		t.Fatal("darkman delegation failed")
-	}
-	if got := fileContents(t, os.Getenv("CALLS")); got != "set light\n" {
-		t.Fatalf("backend also ran standalone actions: %q", got)
-	}
-	executable(t, darkman, "exit 7")
+	executable(t, filepath.Join(root, "bin/gsettings"), "exit 7")
 	if applyMode(context.Background(), dark, o) {
-		t.Fatal("backend failure was swallowed")
+		t.Fatal("explicit GTK theme failure was swallowed")
+	}
+}
+
+func TestMissingGnomeSchemaDoesNotBlockHooks(t *testing.T) {
+	root := testEnvironment(t)
+	t.Setenv("CALLS", filepath.Join(root, "calls"))
+	t.Setenv("PATH", filepath.Join(root, "bin")+":"+os.Getenv("PATH"))
+	executable(t, filepath.Join(root, "bin/gsettings"), "exit 1")
+	executable(t, filepath.Join(root, "user/darkman/theme"), `echo hook >> "$CALLS"`)
+	o := testOptions()
+	o.noGSettings = false
+	if !applyMode(context.Background(), dark, o) || fileContents(t, os.Getenv("CALLS")) != "hook\n" {
+		t.Fatal("missing GNOME schema blocked independent hook integration")
 	}
 }
 

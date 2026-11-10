@@ -1,0 +1,4 @@
+[D-BUS Service]
+Name=org.freedesktop.impl.portal.desktop.wsl_darkman
+Exec="@BINDIR@/wsl-darkman" run
+SystemdService=wsl-darkman.service

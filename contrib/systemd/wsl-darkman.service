@@ -3,7 +3,8 @@ Description=Synchronize WSL appearance with Windows
 Documentation=man:systemd.service(5)
 
 [Service]
-Type=simple
+Type=dbus
+BusName=org.freedesktop.impl.portal.desktop.wsl_darkman
 ExecStart=%h/.local/bin/wsl-darkman run
 Restart=on-failure
 RestartSec=5

@@ -100,12 +100,9 @@ func followWatcher(ctx context.Context, cmd *exec.Cmd, o options, apply func(con
 				startupDeadline = nil
 			}
 			if event.mode != previous {
-				applied := apply(ctx, event.mode)
+				apply(ctx, event.mode)
 				if ctx.Err() != nil {
 					return nil
-				}
-				if !applied && o.backend == "darkman" {
-					return fmt.Errorf("could not send mode to Darkman; check that its service is running")
 				}
 				previous = event.mode
 			}
@@ -168,14 +165,37 @@ func runDaemon(ctx context.Context, o options) error {
 		return err
 	}
 	defer lock.Close()
-	reconnect(ctx, o, func(ctx context.Context) error {
+	runCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	var portal *settingsPortal
+	if !o.noPortal {
+		portal, err = startSettingsPortal(ctx, sessionBusAddress())
+		if err != nil {
+			return fmt.Errorf("start appearance portal: %w (use --no-portal for preferences and hooks only)", err)
+		}
+		defer portal.conn.Close()
+		stopDisconnect := context.AfterFunc(portal.conn.Context(), cancel)
+		defer stopDisconnect()
+		log.Print("Serving the XDG appearance settings portal")
+	}
+	reconnect(runCtx, o, func(ctx context.Context) error {
 		cmd, err := windowsCommand(o, false)
 		if err != nil {
 			return err
 		}
 		return followWatcher(ctx, cmd, o, func(ctx context.Context, m mode) bool {
+			if portal != nil {
+				if err := portal.update(m); err != nil {
+					log.Printf("Publish appearance: %v", err)
+					cancel()
+					return false
+				}
+			}
 			return applyMode(ctx, m, o)
 		})
 	})
+	if ctx.Err() == nil && runCtx.Err() != nil {
+		return fmt.Errorf("appearance portal disconnected; restart the service to reconnect")
+	}
 	return nil
 }

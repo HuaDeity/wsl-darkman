@@ -108,14 +108,9 @@ func runAction(ctx context.Context, command []string, timeout time.Duration, env
 
 func applyMode(ctx context.Context, m mode, o options) bool {
 	log.Printf("Applying %s mode", m)
-	if o.backend == "darkman" {
-		return runAction(ctx, []string{"darkman", "set", string(m)}, o.hookTimeout, nil)
-	}
 	ok := true
 	if !o.noGSettings {
-		if _, err := exec.LookPath("gsettings"); err == nil {
-			ok = runAction(ctx, []string{"gsettings", "set", "org.gnome.desktop.interface", "color-scheme", "prefer-" + string(m)}, o.hookTimeout, nil)
-		}
+		ok = applyGSettings(ctx, m, o)
 	}
 	env := setEnvironment(os.Environ(), "WSL_DARKMAN_MODE", string(m))
 	for _, command := range hooksFor(m) {

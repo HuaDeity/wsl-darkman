@@ -20,6 +20,7 @@ import (
 func testOptions() options {
 	o := defaultOptions()
 	o.noGSettings = true
+	o.noPortal = true
 	o.hookTimeout = 100 * time.Millisecond
 	o.startupTimeout = 2 * time.Second
 	o.shutdownTimeout = 2 * time.Second
@@ -33,8 +34,13 @@ func testEnvironment(t *testing.T) string {
 	for name, subdir := range map[string]string{
 		"XDG_DATA_HOME": "user", "XDG_DATA_DIRS": "system",
 		"XDG_RUNTIME_DIR": "runtime", "XDG_CACHE_HOME": "cache",
+		"XDG_CONFIG_HOME": "config",
 	} {
-		t.Setenv(name, filepath.Join(root, subdir))
+		path := filepath.Join(root, subdir)
+		if err := os.MkdirAll(path, 0700); err != nil {
+			t.Fatal(err)
+		}
+		t.Setenv(name, path)
 	}
 	return root
 }
@@ -71,7 +77,9 @@ func TestCLIOptions(t *testing.T) {
 		}
 	}
 	for _, args := range [][]string{
-		{"run", "get"}, {"invalid"}, {"--source", "other"}, {"--backend", "other"},
+		{"run", "get"}, {"invalid"}, {"--source", "other"}, {"--backend", "darkman"},
+		{"--gtk-light-theme", "Adwaita"}, {"--gtk-dark-theme", "Adwaita-dark"},
+		{"--no-gsettings", "--gtk-light-theme", "Adwaita", "--gtk-dark-theme", "Adwaita-dark"},
 		{"--hook-timeout", "0"}, {"--hook-timeout", "-1"}, {"--hook-timeout", "NaN"},
 		{"--hook-timeout", "Inf"}, {"--hook-timeout", "1e50"}, {"--hook-timeout", "1e-50"},
 		{"--source"}, {"--unknown"},
@@ -142,6 +150,11 @@ func TestProcessHelper(t *testing.T) {
 		fmt.Print("dark\r\ndark\r\nlight\r\nlight\r\n")
 		io.Copy(io.Discard, os.Stdin)
 	case "idle":
+		if path := os.Getenv("HELPER_READY"); path != "" {
+			if err := os.WriteFile(path, []byte("ready"), 0600); err != nil {
+				os.Exit(8)
+			}
+		}
 		io.Copy(io.Discard, os.Stdin)
 	case "stubborn":
 		fmt.Println("dark")
